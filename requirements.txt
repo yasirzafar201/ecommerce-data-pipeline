@@ -1,0 +1,4 @@
+# Core Python Standard Library is utilized for zero-friction setup.
+# Optional data engineering extensions:
+pandas>=2.0.0
+pytest>=7.0.0
