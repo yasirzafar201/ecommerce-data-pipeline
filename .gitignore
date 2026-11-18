@@ -3,11 +3,14 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Data & Database files
+# Data, Database & Quarantine outputs
 *.db
 *.sqlite3
 data/*.db
 data/test_*.db
+data/raw/*.json
+data/processed/*.csv
+data/quarantine/*.json
 
 # Logs
 logs/*.log

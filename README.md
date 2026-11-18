@@ -1,48 +1,61 @@
 # 🛒 E-Commerce Sales Data Engineering ETL Pipeline
 
-An end-to-end Python-based Data Engineering ETL (Extract, Transform, Load) pipeline that ingests raw, semi-structured e-commerce transaction data, enforces automated data quality gates, normalizes multi-currency financial records, and loads clean data into an analytical Star-Schema Data Warehouse (SQLite) and downstream CSV data marts.
+A production-resilient, end-to-end Python Data Engineering ETL/ELT pipeline that ingests messy semi-structured e-commerce transactions, enforces schema contracts & idempotency, isolates bad records in a Dead-Letter Queue (Quarantine Zone), and atomically loads a Star-Schema Analytical Warehouse (SQLite) and cumulative CSV data marts.
 
 ---
 
-## 🏗️ Architecture & Data Flow
+## 🏗️ Production Architecture & Data Flow
 
 ```
 [Raw Sources: JSON / Streaming Batches]
                     │
                     ▼
-          ┌───────────────────┐
-          │    1. EXTRACT     │ ➔ Ingests raw batches (casing variances, currency variations)
-          └─────────┬─────────┘
+        ┌───────────────────────┐
+        │      1. EXTRACT       │ ➔ Raw ingestion + SHA-256 batch checksum
+        └───────────┬───────────┘
                     ▼
-          ┌───────────────────┐
-          │   2. TRANSFORM    │ ➔ Deduplication, USD currency conversion, date dimensions
-          └─────────┬─────────┘
+        ┌───────────────────────┐
+        │ 2. IDEMPOTENCY GATE   │ ➔ Checks etl_run_metadata (skips duplicate replays)
+        └───────────┬───────────┘
                     ▼
-          ┌───────────────────┐
-          │ 3. QUALITY AUDIT  │ ➔ Schema checks, null PKs, non-negative amounts, date sanity
-          └─────────┬─────────┘
+        ┌───────────────────────┐       ┌───────────────────────────────┐
+        │   3. TRANSFORM &      │──────▶│   DEAD-LETTER QUEUE (DLQ)     │
+        │   SCHEMA CONTRACT     │ (Bad) │ - data/quarantine/dlq_*.json  │
+        └───────────┬───────────┘       │ - SQL: quarantine_records     │
+                    │ (Clean)           └───────────────────────────────┘
                     ▼
-          ┌───────────────────┐
-          │      4. LOAD      │
-          └────┬─────────┬────┘
-               │         │
-               ▼         ▼
-     [SQLite Warehouse]   [Analytical CSV Marts]
-     - fact_orders        - clean_orders.csv
-     - dim_customers      - category_performance.csv
-     - agg_daily_sales    - daily_sales_trends.csv
+        ┌───────────────────────┐
+        │  4. QUALITY AUDIT     │ ➔ PK uniqueness, non-negative rules, statuses
+        └───────────┬───────────┘
+                    ▼
+        ┌───────────────────────┐
+        │ 5. ATOMIC ACID LOAD   │ ➔ Out-of-order-safe SQLite UPSERT + SQL Marts
+        └─────┬───────────┬─────┘
+              │           │
+              ▼           ▼
+   [SQLite Warehouse]      [Cumulative CSV Marts]
+   - fact_orders           - clean_orders.csv
+   - dim_customers         - dim_customers.csv
+   - agg_category_sales    - category_performance.csv
+   - agg_daily_sales       - daily_sales_trends.csv
+   - etl_run_metadata
+   - quarantine_records
 ```
 
 ---
 
-## 🚀 Key Features
+## 🛡️ Real-World Data Engineering Problems Solved
 
-* **Zero-Dependency Core:** Built using pure Python standard libraries (`sqlite3`, `csv`, `json`, `datetime`, `unittest`) so it runs anywhere out-of-the-box.
-* **Currency Normalization Engine:** Automatically converts multi-currency orders (USD, EUR, GBP, CAD, PKR) to standard USD baseline for financial reporting.
-* **Automated Data Quality Gate:** Validates primary key uniqueness, nullability, logical constraints (e.g., non-negative prices, future timestamps), and raises alerts before loading.
-* **Star-Schema Analytical Warehouse:** Automatically designs and updates facts, dimensions, and pre-aggregated analytical marts.
-* **Auditing & Structured Logging:** Full execution metrics tracked per run (elapsed time, rows processed, failure metrics) saved to `logs/pipeline.log`.
-* **Automated Test Suite:** Built-in unit test suite covering each stage of the ETL pipeline.
+This repository explicitly addresses the most common production data pipeline failures. Read the full technical deep-dive in **[docs/REAL_WORLD_CHALLENGES.md](docs/REAL_WORLD_CHALLENGES.md)**:
+
+| Production Problem | Naive Failure Mode | Implemented Engineering Solution |
+| :--- | :--- | :--- |
+| **Silent Data Loss** | `try/except: continue` drops broken rows silently | **Dead-Letter Queue (DLQ)** (`src/quarantine.py` + `quarantine_records` table) captures rejected payloads with explicit reasons |
+| **Schema Drift & Bad Currencies** | Unknown currencies silently multiply by `1.0` USD; extra columns break parsers | **Schema Contract Validator** flags unexpected columns as warnings and quarantines unsupported currencies (`JPY`) or missing required columns |
+| **Incremental Overwrites** | Re-computing daily/category totals per batch wipes previous batch metrics | **Full-Warehouse SQL Mart Rebuilds** inside an atomic ACID transaction recalculate `dim_customers`, `agg_category_sales`, and `agg_daily_sales` from full `fact_orders` history |
+| **Out-of-Order Events** | Delayed `PENDING` webhook overwrites newer `COMPLETED` status | **Conditional Timestamp Upsert** (`ON CONFLICT ... WHERE excluded.order_timestamp >= fact_orders.order_timestamp`) prevents stale regressions |
+| **Duplicate Replays** | Retrying a job re-processes the exact same batch file | **SHA-256 Batch Fingerprinting** tracked in `etl_run_metadata` makes runs safely idempotent |
+| **Mixed Date Formats** | Non-standard dates silently replaced with `datetime.now()` | **Multi-Format Parser** handles SQL, ISO-8601 (`Z`), and slash dates; quarantines genuinely corrupted timestamps |
 
 ---
 
@@ -52,21 +65,25 @@ An end-to-end Python-based Data Engineering ETL (Extract, Transform, Load) pipel
 ecommerce-data-pipeline/
 ├── data/
 │   ├── raw/                 # Raw ingested batch files
-│   ├── processed/           # Analytical CSV data marts
+│   ├── processed/           # Cumulative analytical CSV data marts
+│   ├── quarantine/          # Dead-Letter Queue (DLQ) JSON files for rejected rows
 │   └── warehouse.db         # SQLite analytical data warehouse
+├── docs/
+│   └── REAL_WORLD_CHALLENGES.md  # Deep-dive analysis of real-world DE problems solved
 ├── logs/
 │   └── pipeline.log         # Execution audit logs
 ├── src/
 │   ├── __init__.py
-│   ├── config.py            # Environment, paths, exchange rates
-│   ├── extract.py           # Ingestion and synthetic stream generator
-│   ├── transform.py         # Cleaning, normalization, and aggregations
-│   ├── quality.py           # Automated Data Quality rules and assertions
-│   ├── load.py              # Warehouse schema and data loader
-│   └── pipeline.py          # ETL orchestrator
+│   ├── config.py            # Paths, exchange rates, schema contract definitions
+│   ├── extract.py           # Ingestion, SHA-256 hashing & anomaly-aware generator
+│   ├── transform.py         # Schema drift detection, price/date sanitization, dedup
+│   ├── quarantine.py        # Dead-Letter Queue (DLQ) persistence layer
+│   ├── quality.py           # Automated Data Quality assertions
+│   ├── load.py              # ACID warehouse loader & incremental SQL mart rebuilds
+│   └── pipeline.py          # Production ETL orchestrator
 ├── tests/
 │   ├── __init__.py
-│   └── test_pipeline.py     # Unit test suite
+│   └── test_pipeline.py     # Unit tests covering all ETL stages & failure modes
 ├── .gitignore
 ├── README.md
 ├── requirements.txt
@@ -75,50 +92,32 @@ ecommerce-data-pipeline/
 
 ---
 
-## 🛠️ Warehouse Schema Design
-
-### Fact Table: `fact_orders`
-* `order_id` (TEXT, PK): Unique order identifier
-* `customer_id` (TEXT): Normalized customer ID
-* `product_name` (TEXT): Item description
-* `category` (TEXT): Product classification
-* `unit_price_usd` (REAL): Price converted to USD
-* `quantity` (INTEGER): Number of units purchased
-* `total_amount_usd` (REAL): Total gross order value in USD
-* `payment_method` (TEXT): Checkout method
-* `status` (TEXT): Normalized status (`COMPLETED`, `REFUNDED`, `PENDING`)
-* `order_timestamp` (TEXT): Original order timestamp
-* `order_date` (TEXT): Extracted date (`YYYY-MM-DD`)
-* `day_of_week` (TEXT): Day dimension (`Monday`, `Tuesday`, etc.)
-* `loaded_at` (TEXT): ETL load audit timestamp
-
-### Aggregate Mart: `agg_category_sales`
-* `category` (TEXT, PK)
-* `total_revenue_usd` (REAL)
-* `total_units_sold` (INTEGER)
-* `total_orders` (INTEGER)
-* `avg_order_value_usd` (REAL)
-* `last_updated` (TEXT)
-
----
-
 ## ⚡ Quickstart & Usage
 
-### 1. Run the Pipeline
-Generate and process a batch of 150 transactions:
+### 1. Run the Pipeline (with Real-World Anomalies Enabled)
+Generates a batch of 150 orders plus injected real-world anomalies (dirty prices, unknown currency, bad timestamp, late duplicate update, schema drift):
 ```bash
 python run_pipeline.py --records 150
 ```
 
-### 2. Run with Strict Quality Gate
-Halt pipeline immediately if any data anomaly is flagged:
+### 2. Replay an Existing Raw File (Test Idempotency)
+Running the exact same raw file a second time automatically skips duplicate processing:
+```bash
+python run_pipeline.py --input-file data/raw/batch_orders_<timestamp>.json
+```
+To force reprocessing:
+```bash
+python run_pipeline.py --input-file data/raw/batch_orders_<timestamp>.json --force
+```
+
+### 3. Run with Strict Quality Gate
 ```bash
 python run_pipeline.py --records 100 --strict
 ```
 
-### 3. Run Unit Tests
+### 4. Run Unit Test Suite
 ```bash
-python -m unittest discover tests
+python -m unittest discover tests -v
 ```
 
 ---
@@ -126,18 +125,21 @@ python -m unittest discover tests
 ## 📊 Sample Output
 
 ```text
-=============================================
-      PIPELINE EXECUTION SUMMARY
-=============================================
- Run Id                   : RUN-20261117223000
- Status                   : SUCCESS
- Raw Records              : 151
+=======================================================
+           PIPELINE EXECUTION SUMMARY
+=======================================================
+ Run Id                   : RUN-20261118092500123
+ Status                   : COMPLETED_WITH_WARNINGS
+ Batch Hash               : 9f4e2a10c8b1
+ Raw Records              : 154
  Processed Records        : 150
- Categories Summarized    : 4
- Days Analyzed            : 8
- Duration Seconds         : 0.12
+ Quarantined Records      : 3
+ Duplicates Merged        : 1
+ Schema Drift Fields      : ['promo_code_v2']
+ Dlq File                 : data/quarantine/dlq_RUN-20261118092500123.json
+ Duration Seconds         : 0.084
  Warehouse Db             : data/warehouse.db
-=============================================
+=======================================================
 ```
 
 ---
